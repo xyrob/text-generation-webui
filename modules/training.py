@@ -40,6 +40,7 @@ from modules.evaluate import (
 from modules.logging_colors import logger
 from modules.models import reload_model
 from modules.utils import natural_keys
+from jinja2 import Template
 
 MODEL_CLASSES = {v[1]: v[0] for v in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.items()}
 PARAMETERS = ["lora_name", "always_override", "q_proj_en", "v_proj_en", "k_proj_en", "o_proj_en", "gate_proj_en", "down_proj_en", "up_proj_en", "save_steps", "micro_batch_size", "batch_size", "epochs", "learning_rate", "lr_scheduler_type", "lora_rank", "lora_alpha", "lora_dropout", "cutoff_len", "dataset", "eval_dataset", "format", "eval_steps", "raw_text_file", "overlap_len", "newline_favor_len", "higher_rank_limit", "warmup_steps", "optimizer", "hard_cut_string", "train_only_after", "stop_at_loss", "add_eos_token", "min_chars", "report_to"]
@@ -122,7 +123,7 @@ def create_ui():
                 with gr.Column():
                     with gr.Tab(label='Formatted Dataset'):
                         with gr.Row():
-                            format = gr.Dropdown(choices=utils.get_datasets('training/formats', 'json'), value='None', label='Data Format', info='The format file used to decide how to format the dataset input.', elem_classes=['slim-dropdown'], interactive=not mu)
+                            format = gr.Dropdown(choices=utils.get_datasets('training/formats', 'json') + utils.get_datasets('training/formats', 'j2'), value='None', label='Data Format', info='The format file used to decide how to format the dataset input.', elem_classes=['slim-dropdown'], interactive=not mu)
                             ui.create_refresh_button(format, lambda: None, lambda: {'choices': utils.get_datasets('training/formats', 'json')}, 'refresh-button', interactive=not mu)
 
                         with gr.Row():
@@ -457,36 +458,61 @@ def do_train(lora_name: str, always_override: bool, q_proj_en: bool, v_proj_en: 
 
         train_template["template_type"] = "dataset"
 
-        with open(clean_path('training/formats', f'{format}.json'), 'r', encoding='utf-8-sig') as formatFile:
-            format_data: dict[str, str] = json.load(formatFile)
+        if format.endswith('.j2'):
+            with open(clean_path('training/formats', f'{format}'), 'r', encoding='utf-8-sig') as formatFile:
+                # formatFile is a jinja2 template
+                format_data: str = formatFile.read()
+            
+            template = Template(format_data)
 
-        # == store training prompt ==
-        for _, value in format_data.items():
-            prompt_key = f"template_{len(train_template)}"
-            train_template[prompt_key] = value
+            def generate_prompt(data_point: dict):
+                formatted_data = template.render(**data_point)
+                return formatted_data
+            
+            def generate_and_tokenize_prompt(data_point):
+                prompt = generate_prompt(data_point)
+                return tokenize(prompt, add_eos_token)
 
-        def generate_prompt(data_point: dict[str, str]):
-            for options, data in format_data.items():
-                if set(options.split(',')) == set(x[0] for x in data_point.items() if (type(x[1]) is str and len(x[1].strip()) > 0)):
-                    for key, val in data_point.items():
-                        if type(val) is str:
-                            data = data.replace(f'%{key}%', val)
-                    return data
-            raise RuntimeError(f'Data-point "{data_point}" has no keyset match within format "{list(format_data.keys())}"')
+            logger.info("Loading JSON datasets")
+            data = load_dataset("json", data_files=clean_path('training/datasets', dataset))
+            train_data = data['train'].map(generate_and_tokenize_prompt, new_fingerprint='%030x' % random.randrange(16**30))
 
-        def generate_and_tokenize_prompt(data_point):
-            prompt = generate_prompt(data_point)
-            return tokenize(prompt, add_eos_token)
+            if eval_dataset == 'None':
+                eval_data = None
+            else:
+                eval_data = load_dataset("json", data_files=clean_path('training/datasets', eval_dataset))
+                eval_data = eval_data['train'].map(generate_and_tokenize_prompt, new_fingerprint='%030x' % random.randrange(16**30))
+        elif format.endswith('.json'):
+            with open(clean_path('training/formats', f'{format}'), 'r', encoding='utf-8-sig') as formatFile:
+                format_data: dict[str, str] = json.load(formatFile)
 
-        logger.info("Loading JSON datasets")
-        data = load_dataset("json", data_files=clean_path('training/datasets', f'{dataset}.json'))
-        train_data = data['train'].map(generate_and_tokenize_prompt, new_fingerprint='%030x' % random.randrange(16**30))
+            # == store training prompt ==
+            for _, value in format_data.items():
+                prompt_key = f"template_{len(train_template)}"
+                train_template[prompt_key] = value
 
-        if eval_dataset == 'None':
-            eval_data = None
-        else:
-            eval_data = load_dataset("json", data_files=clean_path('training/datasets', f'{eval_dataset}.json'))
-            eval_data = eval_data['train'].map(generate_and_tokenize_prompt, new_fingerprint='%030x' % random.randrange(16**30))
+            def generate_prompt(data_point: dict[str, str]):
+                for options, data in format_data.items():
+                    if set(options.split(',')) == set(x[0] for x in data_point.items() if (type(x[1]) is str and len(x[1].strip()) > 0)):
+                        for key, val in data_point.items():
+                            if type(val) is str:
+                                data = data.replace(f'%{key}%', val)
+                        return data
+                raise RuntimeError(f'Data-point "{data_point}" has no keyset match within format "{list(format_data.keys())}"')
+
+            def generate_and_tokenize_prompt(data_point):
+                prompt = generate_prompt(data_point)
+                return tokenize(prompt, add_eos_token)
+
+            logger.info("Loading JSON datasets")
+            data = load_dataset("json", data_files=clean_path('training/datasets', f'{dataset}.json'))
+            train_data = data['train'].map(generate_and_tokenize_prompt, new_fingerprint='%030x' % random.randrange(16**30))
+
+            if eval_dataset == 'None':
+                eval_data = None
+            else:
+                eval_data = load_dataset("json", data_files=clean_path('training/datasets', f'{eval_dataset}.json'))
+                eval_data = eval_data['train'].map(generate_and_tokenize_prompt, new_fingerprint='%030x' % random.randrange(16**30))
 
     # == We MUST reload model if it went through any previous training, even failed one ==
     if shared.model_dirty_from_training:
